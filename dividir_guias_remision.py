@@ -171,23 +171,33 @@ def extraer_numero_guia(texto: str, serie_preferida: str) -> str | None:
 
 
 def quitar_tipo_societario(nombre: str) -> str:
-    """Elimina SAC, SRL o EIRL al final, con o sin puntos y espacios."""
-    tipo_societario = (
-        r"(?:"
-        # En documentos escaneados OCR puede confundir S con $/5 y C con G.
-        r"[S$5]\s*\.?\s*A\s*\.?\s*[CG]\s*\.?"  # SAC, $.A.C., S.AG.
-        r"|[S$5]\s*\.?\s*R\s*\.?\s*L\s*\.?"    # SRL, S.R.L.
-        r"|E\s*\.?\s*I\s*\.?\s*R\s*\.?\s*L\s*\.?"  # EIRL, E.I.R.L.
-        r")"
+    """Quita formas legales completas y siglas aisladas en cualquier posicion.
+
+    Reconoce puntos, comas y espacios entre letras; prioriza SAC sobre SA.
+    No recorta letras dentro de palabras como CASA, SACHA o ISAAC.
+    """
+    resultado = unicodedata.normalize("NFKC", nombre)
+    resultado = re.sub(r"[¿?¡!]", "", resultado).strip()
+    frases = (
+        r"SOCIEDAD\s+AN[ÓO](?:NIMA|MINA)(?:\s+CERRADA)?"
+        r"|EMPRESA\s+INDIVIDUAL\s+DE\s+RESPONSABILIDAD\s+LIMITADA"
+        r"|SOCIEDAD\s+DE\s+RESPONSABILIDAD\s+LIMITADA"
     )
-    resultado = nombre.strip()
-    resultado = re.sub(
-        rf"(?:\s*[-,]?\s*{tipo_societario})+\s*[.,-]*\s*$",
-        "",
-        resultado,
-        flags=re.IGNORECASE,
+    resultado = re.sub(rf"(?<!\w)(?:{frases})(?!\w)", " ", resultado,
+                       flags=re.IGNORECASE)
+    separador = r"[\s.,]*"
+    siglas = (
+        rf"E{separador}I{separador}R{separador}L"
+        rf"|[S$5]{separador}A{separador}[CG]"
+        rf"|[S$5]{separador}R{separador}L"
+        rf"|S{separador}A"
     )
-    return resultado.strip(" .,-")
+    resultado = re.sub(rf"(?<!\w)(?:{siglas})(?!\w)[.,]*", " ", resultado,
+                       flags=re.IGNORECASE)
+    resultado = re.sub(r"\(\s*\)|\[\s*\]", " ", resultado)
+    resultado = re.sub(r"\s*[-–—]\s*", " - ", resultado)
+    resultado = re.sub(r"(?: - ){2,}", " - ", resultado)
+    return re.sub(r"\s+", " ", resultado).strip(" .,-;")
 
 
 def capitalizar_nombre(nombre: str) -> str:
@@ -224,6 +234,9 @@ def extraer_destinatario(texto: str) -> str | None:
 
 
 def nombre_seguro(texto: str, maximo: int = 120) -> str:
+    """Conserva letras, tildes y &, eliminando signos de interrogacion/exclamacion."""
+    texto = unicodedata.normalize("NFKC", texto)
+    texto = re.sub(r"[¿?¡!]", "", texto)
     texto = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", texto)
     texto = limpiar_espacios(texto).rstrip(". ")
     return texto[:maximo].rstrip(". ") or "Sin_nombre"
@@ -288,6 +301,24 @@ def obtener_datos_pagina(
         uso_ocr = True
         numero = numero or extraer_numero_guia(texto_ocr, serie)
         destinatario = destinatario or extraer_destinatario(texto_ocr)
+
+    if not numero:
+        # Segunda lectura del encabezado SUNAT. Dos escalas deben coincidir;
+        # no se sustituyen letras dudosas por digitos inventados.
+        pagina = documento_ocr.load_page(indice)
+        area = pymupdf.Rect(pagina.rect.width * 0.55, 0,
+                            pagina.rect.width, pagina.rect.height * 0.12)
+        idiomas = set(pytesseract.get_languages(config=""))
+        idioma = "eng" if "eng" in idiomas else "spa"
+        candidatos = []
+        for escala in (2, 3):
+            pix = pagina.get_pixmap(matrix=pymupdf.Matrix(escala, escala),
+                                   clip=area, alpha=False)
+            imagen = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            texto = pytesseract.image_to_string(imagen, lang=idioma, config="--psm 6")
+            candidatos.append(extraer_numero_guia(texto, serie))
+        if candidatos[0] and candidatos[0] == candidatos[1]:
+            numero = candidatos[0]
 
     return numero, destinatario, uso_ocr
 
