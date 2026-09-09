@@ -2,7 +2,7 @@
 """
 Divide uno o varios PDF de guias de remision en archivos de una pagina.
 
-El nombre de cada salida usa el numero desudo apt update la GRE y el destinatario:
+El nombre de cada salida usa el numero de la GRE y el destinatario:
     EG07-00000038 - Whan Li.pdf
 
 Funciona con PDF digitales y con PDF escaneados. Para estos ultimos usa OCR.
@@ -10,8 +10,11 @@ Funciona con PDF digitales y con PDF escaneados. Para estos ultimos usa OCR.
 Dependencias Python:
     python -m pip install pypdf pymupdf pillow pytesseract
 
-Ademas, para documentos escaneados se requiere Tesseract OCR:
+En desarrollo, para documentos escaneados se requiere Tesseract OCR:
     Ubuntu/WSL: sudo apt update && sudo apt install -y tesseract-ocr tesseract-ocr-spa
+
+La compilacion portable realizada con compilar_portable.ps1 incluye Tesseract
+y no requiere instalar Python ni Tesseract en la computadora de destino.
 
 Uso con ventanas de seleccion:
     python dividir_guias_remision.py
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import shutil
 import sys
@@ -32,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf
     import pytesseract
     from PIL import Image, ImageEnhance, ImageFilter, ImageOps
     from pypdf import PdfReader, PdfWriter
@@ -60,20 +64,46 @@ class Resultado:
     estado: str
 
 
-def localizar_tesseract() -> str | None:
-    """Localiza Tesseract en Linux/macOS o en ubicaciones usuales de Windows."""
-    encontrado = shutil.which("tesseract")
-    if encontrado:
-        return encontrado
+def carpeta_recursos() -> Path:
+    """Devuelve la carpeta real o la carpeta temporal creada por PyInstaller."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
 
+
+def localizar_tesseract() -> str | None:
+    """Localiza Tesseract empaquetado, instalado o disponible en PATH."""
+    base = carpeta_recursos()
+    junto_al_ejecutable = Path(sys.executable).resolve().parent
     candidatos = (
+        base / "Tesseract-OCR" / "tesseract.exe",
+        junto_al_ejecutable / "Tesseract-OCR" / "tesseract.exe",
         Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
         Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
     )
     for candidato in candidatos:
-        if candidato.exists():
+        if candidato.is_file():
             return str(candidato)
+
+    encontrado = shutil.which("tesseract")
+    if encontrado:
+        return encontrado
     return None
+
+
+def configurar_tesseract() -> str:
+    """Configura el ejecutable y los idiomas, incluidos los empaquetados."""
+    ejecutable = localizar_tesseract()
+    if not ejecutable:
+        raise RuntimeError(
+            "No se encontro Tesseract OCR dentro del programa ni instalado en la PC."
+        )
+
+    pytesseract.pytesseract.tesseract_cmd = ejecutable
+    tessdata = Path(ejecutable).resolve().parent / "tessdata"
+    if tessdata.is_dir():
+        os.environ["TESSDATA_PREFIX"] = str(tessdata)
+    return ejecutable
 
 
 def quitar_acentos(texto: str) -> str:
@@ -137,17 +167,22 @@ def extraer_numero_guia(texto: str, serie_preferida: str) -> str | None:
 
 
 def quitar_tipo_societario(nombre: str) -> str:
-    """Convierte 'WHAN LI S.A.C.' en 'WHAN LI', sin tocar el resto del nombre."""
-    patrones = (
-        r"S\.?\s*A\.?\s*C\.?",
-        r"E\.?\s*I\.?\s*R\.?\s*L\.?",
-        r"S\.?\s*R\.?\s*L\.?",
-        r"S\.?\s*A\.?\s*A\.?",
-        r"S\.?\s*A\.?",
+    """Elimina SAC, SRL o EIRL al final, con o sin puntos y espacios."""
+    tipo_societario = (
+        r"(?:"
+        # En documentos escaneados OCR puede confundir S con $/5 y C con G.
+        r"[S$5]\s*\.?\s*A\s*\.?\s*[CG]\s*\.?"  # SAC, $.A.C., S.AG.
+        r"|[S$5]\s*\.?\s*R\s*\.?\s*L\s*\.?"    # SRL, S.R.L.
+        r"|E\s*\.?\s*I\s*\.?\s*R\s*\.?\s*L\s*\.?"  # EIRL, E.I.R.L.
+        r")"
     )
     resultado = nombre.strip()
-    for patron in patrones:
-        resultado = re.sub(rf"\s+{patron}\s*$", "", resultado, flags=re.IGNORECASE)
+    resultado = re.sub(
+        rf"(?:\s*[-,]?\s*{tipo_societario})+\s*[.,-]*\s*$",
+        "",
+        resultado,
+        flags=re.IGNORECASE,
+    )
     return resultado.strip(" .,-")
 
 
@@ -199,19 +234,15 @@ def ruta_sin_colision(carpeta: Path, base: str) -> Path:
     return candidato
 
 
-def texto_ocr_pagina(documento: fitz.Document, indice: int) -> str:
-    ejecutable = localizar_tesseract()
-    if not ejecutable:
-        raise RuntimeError(
-            "El PDF es escaneado y Tesseract OCR no esta instalado. "
-            "En Ubuntu/WSL ejecuta: sudo apt install tesseract-ocr tesseract-ocr-spa"
-        )
-    pytesseract.pytesseract.tesseract_cmd = ejecutable
+def texto_ocr_pagina(documento: pymupdf.Document, indice: int) -> str:
+    configurar_tesseract()
 
     pagina = documento.load_page(indice)
     # Ambos datos requeridos aparecen en la mitad superior de la GRE.
-    area = fitz.Rect(0, 0, pagina.rect.width, pagina.rect.height * 0.48)
-    pixmap = pagina.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), clip=area, alpha=False)
+    area = pymupdf.Rect(0, 0, pagina.rect.width, pagina.rect.height * 0.48)
+    pixmap = pagina.get_pixmap(
+        matrix=pymupdf.Matrix(2.5, 2.5), clip=area, alpha=False
+    )
     imagen = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
     imagen = ImageOps.grayscale(imagen)
     imagen = ImageOps.autocontrast(imagen)
@@ -219,13 +250,17 @@ def texto_ocr_pagina(documento: fitz.Document, indice: int) -> str:
     imagen = imagen.filter(ImageFilter.SHARPEN)
 
     idiomas = set(pytesseract.get_languages(config=""))
+    if not idiomas.intersection({"spa", "eng"}):
+        raise RuntimeError(
+            "Tesseract fue encontrado, pero no contiene los idiomas spa o eng."
+        )
     idioma = "spa+eng" if "spa" in idiomas and "eng" in idiomas else ("spa" if "spa" in idiomas else "eng")
     return pytesseract.image_to_string(imagen, lang=idioma, config="--psm 3")
 
 
 def obtener_datos_pagina(
     lector: PdfReader,
-    documento_ocr: fitz.Document,
+    documento_ocr: pymupdf.Document,
     indice: int,
     serie: str,
 ) -> tuple[str | None, str | None, bool]:
@@ -251,7 +286,7 @@ def dividir_pdf(pdf: Path, carpeta_salida: Path, serie: str) -> list[Resultado]:
         except Exception as exc:
             raise RuntimeError(f"El PDF esta protegido y no pudo abrirse: {pdf.name}") from exc
 
-    documento_ocr = fitz.open(str(pdf))
+    documento_ocr = pymupdf.open(str(pdf))
     resultados: list[Resultado] = []
 
     try:
