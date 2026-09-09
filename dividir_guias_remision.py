@@ -21,6 +21,10 @@ Uso con ventanas de seleccion:
 
 Uso desde terminal:
     python dividir_guias_remision.py archivo1.pdf archivo2.pdf -o Guias_separadas
+
+Se pueden seleccionar varios PDF en una sola ejecucion. Si una misma guia se
+repite dentro de un PDF, entre varios PDF o ya existe en la carpeta de salida,
+se conserva un solo archivo y la repeticion se registra en el reporte CSV.
 """
 
 from __future__ import annotations
@@ -234,6 +238,16 @@ def ruta_sin_colision(carpeta: Path, base: str) -> Path:
     return candidato
 
 
+def obtener_guias_existentes(carpeta: Path, serie: str) -> dict[str, str]:
+    """Indexa por numero las guias que ya existen en la carpeta de salida."""
+    existentes: dict[str, str] = {}
+    for archivo in sorted(carpeta.glob("*.pdf")):
+        numero = extraer_numero_guia(archivo.stem, serie)
+        if numero and numero not in existentes:
+            existentes[numero] = archivo.name
+    return existentes
+
+
 def texto_ocr_pagina(documento: pymupdf.Document, indice: int) -> str:
     configurar_tesseract()
 
@@ -278,7 +292,12 @@ def obtener_datos_pagina(
     return numero, destinatario, uso_ocr
 
 
-def dividir_pdf(pdf: Path, carpeta_salida: Path, serie: str) -> list[Resultado]:
+def dividir_pdf(
+    pdf: Path,
+    carpeta_salida: Path,
+    serie: str,
+    guias_conservadas: dict[str, str],
+) -> list[Resultado]:
     lector = PdfReader(str(pdf))
     if lector.is_encrypted:
         try:
@@ -307,11 +326,29 @@ def dividir_pdf(pdf: Path, carpeta_salida: Path, serie: str) -> list[Resultado]:
                 base = f"{numero} - {destinatario}"
                 estado = "Correcto (OCR)" if uso_ocr else "Correcto"
 
+                # El numero de GRE es la clave unica. Se conserva la primera
+                # copia encontrada, aunque otra repeticion tenga distinto nombre.
+                if numero in guias_conservadas:
+                    resultados.append(
+                        Resultado(
+                            pdf_origen=pdf.name,
+                            pagina=indice + 1,
+                            numero_guia=numero,
+                            destinatario=destinatario,
+                            archivo_salida=guias_conservadas[numero],
+                            estado="Duplicada - omitida",
+                        )
+                    )
+                    continue
+
             salida = ruta_sin_colision(carpeta_salida, nombre_seguro(base))
             escritor = PdfWriter()
             escritor.add_page(pagina)
             with salida.open("wb") as archivo_salida:
                 escritor.write(archivo_salida)
+
+            if numero:
+                guias_conservadas[numero] = salida.name
 
             resultados.append(
                 Resultado(
@@ -412,20 +449,32 @@ def main() -> int:
     carpeta.mkdir(parents=True, exist_ok=True)
 
     resultados: list[Resultado] = []
+    guias_conservadas = obtener_guias_existentes(carpeta, argumentos.serie)
     try:
         for pdf in archivos:
             print(f"Procesando: {pdf.name}")
-            resultados.extend(dividir_pdf(pdf, carpeta, argumentos.serie))
+            resultados.extend(
+                dividir_pdf(
+                    pdf,
+                    carpeta,
+                    argumentos.serie,
+                    guias_conservadas,
+                )
+            )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 3
 
     reporte = guardar_reporte(resultados, carpeta)
-    correctos = sum(item.estado.startswith("Correcto") for item in resultados)
-    revisar = len(resultados) - correctos
+    generados = sum(item.estado.startswith("Correcto") for item in resultados)
+    duplicados = sum(item.estado.startswith("Duplicada") for item in resultados)
+    revisar = sum(item.estado.startswith("Revisar") for item in resultados)
 
     print(f"\nListo: {len(resultados)} pagina(s) procesada(s).")
-    print(f"Correctas: {correctos} | Por revisar: {revisar}")
+    print(
+        f"Archivos nuevos: {generados} | "
+        f"Duplicadas omitidas: {duplicados} | Por revisar: {revisar}"
+    )
     print(f"Carpeta: {carpeta}")
     print(f"Reporte: {reporte.name}")
     return 0 if revisar == 0 else 4
